@@ -33,4 +33,4 @@ For all command line arguments use `docker run --rm henter/nsqdelay -h`
     	NSQD topic for delayed messages (default "delayed")
 ```
 
-Otherwise run it with `docker-compose up` (build container, link to nsq and redis)
+Otherwise run it with `docker-compose up` (build container, links to nsq and redis)
