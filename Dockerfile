@@ -5,20 +5,20 @@ RUN echo "deb http://ftp.debian.org/debian jessie-backports main contrib non-fre
 RUN apt-get update; apt-get install -y libsqlite3-dev
 
 # install godep
-RUN go get github.com/tools/godep
+RUN go get github.com/Masterminds/glide
 
 # copy source code
-ADD . /go/src/github.com/bsphere/nsqdelay
+ADD . /go/src/github.com/henter/nsqdelay
 
-# install godep dependencies
-WORKDIR /go/src/github.com/bsphere/nsqdelay
+# install dependencies
+WORKDIR /go/src/github.com/henter/nsqdelay
 
-RUN godep restore
+RUN glide install
 
 WORKDIR /go
 
 # build and install the source code
-RUN go install github.com/bsphere/nsqdelay
+RUN go install github.com/henter/nsqdelay
 
 VOLUME ["/data"]
 

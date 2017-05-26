@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,84 +8,48 @@ import (
 	"sync"
 	"time"
 
-	_ "code.google.com/p/gosqlite/sqlite3"
-	"github.com/augurysys/timestamp"
 	"github.com/bitly/go-nsq"
+	"github.com/garyburd/redigo/redis"
 )
 
-// DelayedMessage represents a data structure for publishing delayed messages
-// in a JSON encoded message body
-type DelayedMessage struct {
-	Topic  string              `json:"topic"`
-	Body   string              `json:"body"`
-	SendAt timestamp.Timestamp `json:"send_at"`
+// Message from nsq delayed queue, in a JSON encoded message body
+type Message struct {
+	Topic  string   `json:"topic"`
+	Body   string   `json:"body"`
+	SendIn int64	`json:"send_in"`
 }
 
-type message struct {
-	ID     string
-	Topic  string
-	Body   []byte
-	SendAt timestamp.Timestamp
-}
+var RedisPool *redis.Pool
+var redis_address, redis_key string
 
-var db *sql.DB
-
-var insert chan *message
+// pub messages to target nsq topic
+var publish chan *Message
 
 func main() {
 	// parse command line arguments
-	var lookupd, topic, nsqd, dbpath string
+	var lookupd, topic, nsqd string
 
-	flag.StringVar(&lookupd, "lookupd_http_address", "http://127.0.0.1:4161",
-		"lookupd HTTP address")
-
-	flag.StringVar(&nsqd, "nsqd_tcp_address", "127.0.0.1:4150",
-		"nsqd TCP address")
-
-	flag.StringVar(&topic, "topic", "delayed",
-		"NSQD topic for delayed messages")
-
-	flag.StringVar(&dbpath, "db", "/data/db.dat", "database file path")
+	flag.StringVar(&lookupd, "lookupd_http_address", "http://127.0.0.1:4161", "lookupd HTTP address")
+	flag.StringVar(&nsqd, "nsqd_tcp_address", "127.0.0.1:4150", "nsqd TCP address")
+	flag.StringVar(&redis_address, "redis_address", "127.0.0.1:6379", "redis address")
+	flag.StringVar(&topic, "topic", "delayed", "NSQD topic for delayed messages")
 	flag.Parse()
 
-	if lookupd == "" || topic == "" || nsqd == "" || dbpath == "" {
+	if lookupd == "" || topic == "" || nsqd == "" || redis_address == "" {
 		flag.PrintDefaults()
 		log.Fatal("invalid arguments")
 	}
 
-	// initialize the sqlite3 database
-	var err error
-	db, err = sql.Open("sqlite3", dbpath)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	defer db.Close()
-
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS messages(id TEXT, send_at INTEGER, topic TEXT, body BLOB);`); err != nil {
-
-		log.Fatal(err)
-	}
-	if _, err := db.Exec(`
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_messages ON messages(id);`); err != nil {
-
-		log.Fatal(err)
-	}
-
-	// initialize channels
-	insert = make(chan *message)
-	publish := make(chan *message)
+	redis_key = "nsqdelay_" + topic
 
 	// initialize a consumer for delayed messages
-	c, err := nsq.NewConsumer(topic, "scheduler", nsq.NewConfig())
+	c, err := nsq.NewConsumer(topic, "nsqdelay_scheduler", nsq.NewConfig())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// register an handler for incoming messages
+	// consume nsq delayed queue, insert to redis
 	c.AddHandler(nsq.HandlerFunc(messageHandler))
-
 	if err := c.ConnectToNSQLookupd(lookupd); err != nil {
 		log.Fatal(err)
 	}
@@ -97,115 +60,99 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// handle message publishing with retries in a goroutine
-	go publishHandler(p, publish)
+	// messages to target
+	publish = make(chan *Message)
 
-	// handle sqlite insert, query and remove in a goroutine
+	// consume from redis zset, send to publish chan
 	go func() {
 		for {
-			select {
-			case m := <-insert:
-				if _, err := db.Exec(`
-					REPLACE INTO messages(id, send_at, topic, body) VALUES(?, ?, ?, ?);`,
-					m.ID, m.SendAt.Unix(), m.Topic, m.Body); err != nil {
-
-					log.Print(err)
-				}
-
-			default:
-				func() {
-					now := time.Now().Unix()
-
-					rows, err := db.Query(
-						"SELECT id, topic, body from messages where send_at<?",
-						now)
-
-					if err != nil {
-						log.Print(err)
-						return
-					}
-
-					defer rows.Close()
-
-					var del []*message
-					defer func() {
-						for _, d := range del {
-							// remove the message from sqlite
-							if _, err := db.Exec(`
-								DELETE from messages WHERE id=?`, d.ID); err != nil {
-
-								log.Print(err)
-							}
-						}
-					}()
-
-					for rows.Next() {
-						var m message
-
-						if err := rows.Scan(&m.ID, &m.Topic, &m.Body); err != nil {
-							log.Print(err)
-							return
-						}
-
-						// publish the message
-						publish <- &m
-
-						// mark the message for deletion
-						del = append(del, &m)
-					}
-
-					if rows.Err() != nil {
-						log.Print(err)
-						return
-					}
-
-					time.Sleep(time.Second)
-				}()
-			}
+			consumeRedis(publish)
+			time.Sleep(time.Second)
 		}
 	}()
+
+	// consume publish chan, send to target nsq topic
+	go publishHandler(p, publish)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	wg.Wait()
 }
 
+// read redis zset, send to nsq target topic
+func consumeRedis(publish chan *Message) {
+	conn := newRedisPool().Get()
+	defer conn.Close()
+
+	now := time.Now().Unix()
+	rows, err := redis.Strings(conn.Do("ZRANGEBYSCORE", redis_key, "-inf", now))
+	if err != nil {
+		log.Printf(err.Error())
+	}
+
+	for _, s := range rows {
+		var msg Message
+
+		err := json.Unmarshal([]byte(s), &msg)
+		if err != nil {
+			log.Printf("message encode error " + s)
+			continue
+		}
+
+		log.Printf("message from redis " + s)
+		publish <- &msg
+	}
+
+	conn.Do("ZREMRANGEBYSCORE", redis_key, "-inf", now)
+}
+
+// insert into redis zset, fire timestamp as score
+func insertToRedis(msg *Message) {
+	conn := newRedisPool().Get()
+	defer conn.Close()
+
+	now := time.Now().Unix()
+	execute_timestamp := now + msg.SendIn
+
+	bytes, _ := json.Marshal(msg)
+	_, err := conn.Do("ZADD", redis_key, execute_timestamp, bytes)
+	if err != nil {
+		log.Printf(err.Error())
+	}
+	log.Printf("message insert to redis " + string(bytes))
+}
+
+// handler nsq incoming messages, insert to redis
 func messageHandler(m *nsq.Message) error {
 	defer m.Finish()
-	var d DelayedMessage
+	var msg Message
 
-	if err := json.Unmarshal(m.Body, &d); err != nil {
+	if err := json.Unmarshal(m.Body, &msg); err != nil {
 		log.Print(err)
 		return err
 	}
 
 	// data validation
-	if d.Topic == "" || d.Body == "" {
-		log.Print("invalid delayed message data")
+	if msg.Topic == "" || msg.Body == "" || msg.SendIn == 0 {
+		log.Print("invalid delayed message data " + string(m.Body))
 		return errors.New("invalid delayed message data")
 	}
 
-	// insert the message to sqlite
-	ms := &message{
-		ID:     string(m.ID[:nsq.MsgIDLength]),
-		Topic:  d.Topic,
-		Body:   []byte(d.Body),
-		SendAt: d.SendAt,
-	}
-
-	insert <- ms
+	insertToRedis(&msg)
+	log.Print("received delayed message from nsq " + string(m.Body))
 
 	return nil
 }
 
-func publishHandler(p *nsq.Producer, publish chan *message) {
+// send message to nsq target topic
+func publishHandler(p *nsq.Producer, publish chan *Message) {
 	for {
 		m := <-publish
-		if err := p.Publish(m.Topic, m.Body); err != nil {
+		if err := p.Publish(m.Topic, []byte(m.Body)); err != nil {
 			log.Print(err)
 
 			// retry to send the message in 1 second
-			go func(m *message) {
+			go func(m *Message) {
 				time.Sleep(time.Second)
 				publish <- m
 			}(m)
@@ -213,6 +160,29 @@ func publishHandler(p *nsq.Producer, publish chan *message) {
 			continue
 		}
 
-		log.Printf("published message '%s' to topic '%s'", m.ID, m.Topic)
+		log.Printf("published message '%s' to topic '%s'", m.Body, m.Topic)
 	}
+}
+
+func newRedisPool() *redis.Pool {
+	if RedisPool == nil {
+		RedisPool = &redis.Pool{
+			MaxIdle:     50,
+			MaxActive:   1000,
+			IdleTimeout: 3600 * time.Second,
+			Dial: func() (c redis.Conn, err error) {
+				c, err = redis.Dial("tcp", redis_address)
+				if err != nil {
+					log.Fatalf(err.Error())
+				}
+				return c, err
+			},
+			TestOnBorrow: func(c redis.Conn, t time.Time) error {
+				_, err := c.Do("PING")
+				return err
+			},
+		}
+	}
+
+	return RedisPool
 }

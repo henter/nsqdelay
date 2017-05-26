@@ -1,0 +1,32 @@
+version: '2'
+services:
+  nsqdelay:
+    build: .
+    command: -lookupd_http_address=http://nsqlookupd:4161 -nsqd_tcp_address=nsqd:4150 -redis_address=redis:6379
+    links:
+      - nsqlookupd
+      - nsqd
+      - redis
+
+  redis:
+    image: redis:3.0.7
+    ports:
+      - "6379"
+
+  nsqlookupd:
+    image: nsqio/nsq:v0.3.8
+    command: /nsqlookupd
+    ports:
+      - "4160:4160"
+      - "4161:4161"
+  nsqd:
+    image: nsqio/nsq:v0.3.8
+    command: /nsqd --lookupd-tcp-address=nsqlookupd:4160
+    ports:
+      - "4150:4150"
+      - "4151:4151"
+  nsqadmin:
+    image: nsqio/nsq:v0.3.8
+    command: /nsqadmin --lookupd-http-address=nsqlookupd:4161
+    ports:
+      - "4171:4171"
