@@ -22,4 +22,15 @@ Usage
 -----
 For all command line arguments use `docker run --rm henter/nsqdelay -h`
 
-Otherwise run it with `docker-compose up`
+```
+  -lookupd_http_address string
+    	lookupd HTTP address (default "http://127.0.0.1:4161")
+  -nsqd_tcp_address string
+    	nsqd TCP address (default "127.0.0.1:4150")
+  -redis_address string
+    	redis address (default "127.0.0.1:6379")
+  -topic string
+    	NSQD topic for delayed messages (default "delayed")
+```
+
+Otherwise run it with `docker-compose up` (build container, link to nsq and redis)
