@@ -14,9 +14,10 @@ import (
 
 // Message from nsq delayed queue, in a JSON encoded message body
 type Message struct {
-	Topic  string   `json:"topic"`
-	Body   string   `json:"body"`
-	SendIn int64	`json:"send_in"`
+	Id		string   `json:"id"`
+	Topic	string   `json:"topic"`
+	Body	string   `json:"body"`
+	SendIn	int64	 `json:"send_in"`
 }
 
 var RedisPool *redis.Pool
@@ -138,6 +139,7 @@ func messageHandler(m *nsq.Message) error {
 		return errors.New("invalid delayed message data")
 	}
 
+	msg.Id = string(m.ID[:nsq.MsgIDLength])
 	insertToRedis(&msg)
 	log.Print("received delayed message from nsq " + string(m.Body))
 
